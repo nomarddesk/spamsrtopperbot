@@ -2,8 +2,8 @@
 
 A single Telegram bot can protect multiple PUBLIC channels. Each connected channel
 has its own 30-day license, monitored join events, Keep/Remove decisions and bursts.
-Payments: TON or official USDT jetton on TON, MANUALLY confirmed on-chain by an
-owner. Neither a screenshot nor a typed tx hash activates access automatically.
+Payments: TON only. Each invoice has a unique on-chain comment, QR/deep link,
+60-minute countdown, and automatic Toncenter transaction verification.
 
 The Telegram Bot API does NOT provide a full channel member list. Only membership
 updates delivered while this bot is a channel admin can be acted on.
@@ -16,6 +16,8 @@ import binascii
 import html
 import logging
 import os
+from io import BytesIO
+from urllib.parse import quote
 import re
 import secrets
 import sqlite3
@@ -26,7 +28,9 @@ from decimal import Decimal, ROUND_UP
 from pathlib import Path
 
 import httpx
-from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
+import qrcode
+from telegram import (ChatMember, CopyTextButton, InlineKeyboardButton,
+                      InlineKeyboardMarkup, Update)
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes
@@ -49,8 +53,12 @@ BOT_TOKEN = os.getenv('BOT_TOKEN','').strip()
 OWNER_IDS = parse_ids(os.getenv('OWNER_IDS') or os.getenv('ADMIN_ID',''))
 DB_PATH = os.getenv('DB_PATH','/data/guard_saas.db')
 TON_WALLET = os.getenv('TON_WALLET','').strip()
-USDT_WALLET = (os.getenv('USDT_TON_WALLET','').strip() or TON_WALLET)
-USDT_MASTER = 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs'
+TONCENTER_BASE_URL = os.getenv('TONCENTER_BASE_URL','https://toncenter.com/api/v2').rstrip('/')
+TONCENTER_API_KEY = os.getenv('TONCENTER_API_KEY','').strip()
+PAYMENT_POLL_SECONDS = max(10, int(os.getenv('PAYMENT_POLL_SECONDS','15' if TONCENTER_API_KEY else '30')))
+PAYMENT_INDEX_GRACE_S = max(300, int(os.getenv('PAYMENT_INDEX_GRACE_SECONDS','1800')))
+INVOICE_LIFETIME_S = 60 * 60
+NANO_TON = Decimal('1000000000')
 PRICE_USD = Decimal('30.00')
 LICENSE_DAYS = 30
 BURST_LIMIT = max(2, int(os.getenv('BURST_THRESHOLD','200')))
@@ -58,7 +66,7 @@ BURST_WINDOW_S = max(60,int(os.getenv('BURST_WINDOW_MINUTES','10'))*60)
 WARNING_AT = max(1,int(os.getenv('SUBSCRIBER_WARNING_AT','900')))
 ALERT_DELAY = max(0.2,float(os.getenv('ALERT_DELAY_SECONDS','1.1')))
 CHANNEL_RX = re.compile(r'^@[a-zA-Z0-9_]{5,32}$')
-TX_RX = re.compile(r'^[a-zA-Z0-9_+\-=/]{32,120}$')
+
 
 
 def valid_mainnet_wallet(address: str) -> bool:
@@ -72,6 +80,125 @@ def valid_mainnet_wallet(address: str) -> bool:
         return binascii.crc_hqx(raw[:34],0)==int.from_bytes(raw[34:36],'big')
     except (ValueError,binascii.Error):
         return False
+
+
+
+def ton_raw_address(address: str) -> str | None:
+    """Normalize raw or user-friendly TON address to workchain:accounthex."""
+    address = (address or '').strip()
+    if ':' in address:
+        wc, account = address.split(':', 1)
+        if re.fullmatch(r'-?\d+', wc) and re.fullmatch(r'[0-9a-fA-F]{64}', account):
+            return f'{int(wc)}:{account.lower()}'
+        return None
+    try:
+        padded = address + '=' * ((4 - len(address) % 4) % 4)
+        raw = base64.urlsafe_b64decode(padded)
+        if len(raw) != 36 or raw[0] not in (0x11, 0x51):
+            return None
+        if binascii.crc_hqx(raw[:34], 0) != int.from_bytes(raw[34:36], 'big'):
+            return None
+        wc = int.from_bytes(raw[1:2], 'big', signed=True)
+        return f'{wc}:{raw[2:34].hex()}'
+    except (ValueError, binascii.Error):
+        return None
+
+
+def ton_comment(in_msg: dict) -> str:
+    """Return Toncenter's decoded text comment, when available."""
+    value = in_msg.get('message')
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return str(value.get('text') or value.get('message') or '').strip()
+    content = in_msg.get('message_content') or {}
+    if isinstance(content, dict):
+        decoded = content.get('decoded') or {}
+        if isinstance(decoded, dict):
+            text = decoded.get('text') or decoded.get('text_comment')
+            if text:
+                return str(text).strip()
+        text = content.get('text')
+        if text:
+            return str(text).strip()
+    # Some v2 responses expose plain-text comment bytes as base64 in msg.dataText.
+    msg_data = in_msg.get('msg_data') or {}
+    if isinstance(msg_data, dict) and msg_data.get('@type') == 'msg.dataText':
+        try:
+            raw = base64.b64decode(msg_data.get('text') or '')
+            if raw.startswith(b'\x00\x00\x00\x00'):
+                raw = raw[4:]
+            return raw.decode('utf-8').strip()
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            return ''
+    return ''
+
+
+def transaction_is_failed(tx: dict) -> bool:
+    """Reject transactions Toncenter explicitly marks aborted, bounced or failed."""
+    in_msg = tx.get('in_msg') or {}
+    if in_msg.get('bounced') is True or tx.get('aborted') is True:
+        return True
+    desc = tx.get('description') or {}
+    if isinstance(desc, dict):
+        if desc.get('aborted') is True or desc.get('destroyed') is True:
+            return True
+        for key in ('compute_ph', 'action'):
+            phase = desc.get(key)
+            if isinstance(phase, dict) and phase.get('success') is False:
+                return True
+    return False
+
+
+def ton_transaction_matches_invoice(tx: dict, invoice, wallet_raw: str) -> bool:
+    """Strictly match an inbound TON transfer by recipient, amount, memo and time."""
+    try:
+        utime = int(tx.get('utime') or 0)
+        if utime < float(invoice['created_at']) - 120 or utime > float(invoice['expires_at']):
+            return False
+        if transaction_is_failed(tx):
+            return False
+        in_msg = tx.get('in_msg') or {}
+        if not isinstance(in_msg, dict) or not in_msg.get('source'):
+            return False
+        destination = ton_raw_address(str(in_msg.get('destination') or ''))
+        if not destination or destination != wallet_raw:
+            return False
+        received_nano = int(str(in_msg.get('value') or '0'))
+        expected_nano = int((Decimal(str(invoice['amount'])) * NANO_TON).to_integral_value())
+        if received_nano != expected_nano:
+            return False
+        if ton_comment(in_msg) != str(invoice['memo']):
+            return False
+        txid = tx.get('transaction_id') or {}
+        return bool(txid.get('hash'))
+    except (ValueError, TypeError, ArithmeticError):
+        return False
+
+
+def build_ton_deep_link(wallet: str, amount: str, memo: str, expires_at: float) -> str:
+    nano = int((Decimal(amount) * NANO_TON).to_integral_value())
+    return (f'ton://transfer/{wallet}?amount={nano}'
+            f'&text={quote(memo, safe="")}&exp={int(expires_at)}')
+
+
+def build_qr_image(payload: str) -> BytesIO:
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M,
+                       box_size=8, border=4)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color='black', back_color='white')
+    buffer = BytesIO()
+    buffer.name = 'ton_payment_qr.png'
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+    return buffer
+
+
+def countdown_text(expires_at: float, now: float | None = None) -> str:
+    seconds = max(0, int(float(expires_at) - (time.time() if now is None else now)))
+    minutes, seconds = divmod(seconds, 60)
+    return f'{minutes:02d}:{seconds:02d}'
 
 
 def stamp(ts: float|None) -> str:
@@ -149,7 +276,8 @@ class Store:
             created_at REAL NOT NULL, expires_at REAL NOT NULL,
             state TEXT NOT NULL DEFAULT 'awaiting',
             tx_hash TEXT UNIQUE, submitted_at REAL, reviewed_at REAL,
-            reviewed_by INTEGER
+            reviewed_by INTEGER, message_chat_id INTEGER, message_id INTEGER,
+            last_countdown_bucket INTEGER NOT NULL DEFAULT -1
         );
         CREATE INDEX IF NOT EXISTS idx_invoice_pending ON invoices(state,created_at);
         CREATE TABLE IF NOT EXISTS license_notices (
@@ -158,6 +286,14 @@ class Store:
             PRIMARY KEY(chat_id,expiry,kind)
         );
         ''')
+        invoice_columns = {r['name'] for r in self.db.execute('PRAGMA table_info(invoices)')}
+        for name, definition in (
+            ('message_chat_id', 'INTEGER'),
+            ('message_id', 'INTEGER'),
+            ('last_countdown_bucket', 'INTEGER NOT NULL DEFAULT -1'),
+        ):
+            if name not in invoice_columns:
+                self.db.execute(f'ALTER TABLE invoices ADD COLUMN {name} {definition}')
         self.db.execute("UPDATE bursts SET state='open',token=NULL WHERE state='running'")
         self.db.commit()
 
@@ -188,46 +324,80 @@ class Store:
         with self.db:
             self.db.execute('UPDATE channels SET expires_at=? WHERE chat_id=?',
                             (max(now, float(self.channel(cid)['expires_at']))+days*86400,cid))
-    def create_invoice(self,cid:int,payer:int,asset:str,amount:str,wallet:str):
+    def create_invoice(self,cid:int,payer:int,amount:str,wallet:str):
         invoice_id='NG'+secrets.token_hex(5).upper()
         memo='NSG-'+secrets.token_hex(6).upper()
         now=time.time()
         with self.db:
+            existing=self.db.execute("""SELECT * FROM invoices WHERE chat_id=? AND payer_id=?
+                AND state='awaiting' AND expires_at>? ORDER BY created_at DESC LIMIT 1""",
+                (cid,payer,now)).fetchone()
+            if existing:
+                return existing
             self.db.execute('''INSERT INTO invoices
                 (id,chat_id,payer_id,asset,amount,usd_price,wallet,memo,created_at,expires_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                (invoice_id,cid,payer,asset,amount,str(PRICE_USD),wallet,memo,now,now+1200))
+                (invoice_id,cid,payer,'TON',amount,str(PRICE_USD),wallet,memo,now,now+INVOICE_LIFETIME_S))
         return self.invoice(invoice_id)
-    def invoice(self,id:str): return self.db.execute('SELECT * FROM invoices WHERE id=?',(id,)).fetchone()
-    def submit_invoice(self,id:str,uid:int,txhash:str)->str:
+
+    def active_invoice_for(self,cid:int,payer:int):
+        return self.db.execute("""SELECT * FROM invoices WHERE chat_id=? AND payer_id=?
+            AND state='awaiting' AND expires_at>? ORDER BY created_at DESC LIMIT 1""",
+            (cid,payer,time.time())).fetchone()
+
+    def invoice(self,id:str):
+        return self.db.execute('SELECT * FROM invoices WHERE id=?',(id,)).fetchone()
+
+    def attach_invoice_message(self,id:str,chat_id:int,message_id:int):
+        bucket=int((float(self.invoice(id)['expires_at'])-time.time())//30)
+        with self.db:
+            self.db.execute('UPDATE invoices SET message_chat_id=?,message_id=?,last_countdown_bucket=? WHERE id=?',
+                            (chat_id,message_id,bucket,id))
+
+    def countdown_bucket_changed(self,inv)->bool:
+        bucket=int((float(inv['expires_at'])-time.time())//30)
+        return bucket != int(inv['last_countdown_bucket'])
+
+    def mark_countdown_bucket(self,id:str):
+        bucket=int((float(self.invoice(id)['expires_at'])-time.time())//30)
+        with self.db:
+            self.db.execute('UPDATE invoices SET last_countdown_bucket=? WHERE id=?',(bucket,id))
+
+    def pending_invoices(self,now:float|None=None):
+        now=time.time() if now is None else now
+        return self.db.execute('''SELECT * FROM invoices WHERE state='awaiting' AND asset='TON'
+            AND expires_at>=? ORDER BY created_at''',(now-PAYMENT_INDEX_GRACE_S,)).fetchall()
+
+    def expire_old_invoices(self,now:float|None=None):
+        now=time.time() if now is None else now
+        with self.db:
+            return self.db.execute('''UPDATE invoices SET state='expired'
+                WHERE state='awaiting' AND expires_at<?''',(now-PAYMENT_INDEX_GRACE_S,)).rowcount
+
+    def mark_invoice_paid(self,id:str,tx_hash:str)->tuple[bool,str]:
         inv=self.invoice(id)
-        if not inv or inv['payer_id']!=uid: return 'Invoice not found or it belongs to another user.'
-        if inv['state']!='awaiting': return 'Invoice has already been submitted or closed.'
-        if time.time()>inv['expires_at']: return 'This invoice expired; create a fresh invoice.'
+        if not inv or inv['state']!='awaiting':
+            return False,'Invoice is no longer awaiting payment.'
+        now=time.time()
+        if now < float(inv['created_at']) or now > float(inv['expires_at']) + PAYMENT_INDEX_GRACE_S:
+            return False,'Invoice is outside its payment verification window.'
         try:
             with self.db:
-                self.db.execute("UPDATE invoices SET state='submitted',tx_hash=?,submitted_at=? WHERE id=?",
-                                (txhash,time.time(),id))
+                updated=self.db.execute('''UPDATE invoices SET state='paid',tx_hash=?,
+                    reviewed_at=?,reviewed_by=0 WHERE id=? AND state='awaiting' ''',
+                    (tx_hash,now,id))
+                if updated.rowcount != 1:
+                    return False,'Invoice already processed.'
+                row=self.channel(inv['chat_id'])
+                end=max(now,float(row['expires_at']))+LICENSE_DAYS*86400
+                self.db.execute('UPDATE channels SET expires_at=? WHERE chat_id=?',(end,inv['chat_id']))
         except sqlite3.IntegrityError:
-            return 'This transaction hash has already been claimed by another invoice.'
-        return 'ok'
-    def approve(self,id:str,who:int)->tuple[bool,str]:
-        inv=self.invoice(id)
-        if not inv or inv['state']!='submitted': return False,'Invoice is not awaiting verification.'
-        with self.db:
-            updated=self.db.execute("UPDATE invoices SET state='approved',reviewed_at=?,reviewed_by=? WHERE id=? AND state='submitted'",
-                                    (time.time(),who,id))
-            if updated.rowcount!=1: return False,'Already reviewed.'
-            row=self.channel(inv['chat_id'])
-            end=max(time.time(),float(row['expires_at']))+LICENSE_DAYS*86400
-            self.db.execute('UPDATE channels SET expires_at=? WHERE chat_id=?',(end,inv['chat_id']))
+            return False,'This blockchain transaction was already used for another invoice.'
         return True,stamp(end)
-    def reject(self,id:str,who:int)->bool:
-        with self.db:
-            return self.db.execute("UPDATE invoices SET state='rejected',reviewed_at=?,reviewed_by=? WHERE id=? AND state='submitted'",
-                                   (time.time(),who,id)).rowcount==1
+
     def invoices_waiting(self):
-        return self.db.execute("SELECT * FROM invoices WHERE state='submitted' ORDER BY submitted_at").fetchall()
+        return self.db.execute("SELECT * FROM invoices WHERE state='awaiting' AND asset='TON' ORDER BY created_at").fetchall()
+
     def record_join(self,update_id:int,cid:int,user,joined_at:float):
         if not self.active(cid): return None,None,0
         with self.db:
@@ -421,14 +591,13 @@ async def cmd_start(update,context):
         '🛡 NomardDesk Subscriber Guard\n\n'
         'Protect public Telegram channels without CAPTCHA. New-member alerts have '
         'Keep / Remove buttons. When 200 join within 10 minutes, review a bulk-removal batch.\n\n'
-        '💳 $30 per channel for 30 days. Pay in TON or USDT on TON.\n'
-        'Payment verification is reviewed on-chain by our team; submitting a hash '
-        'does not automatically activate service.\n\n'
+        '💳 $30 per channel / 30 days. TON mainnet only.\n'
+        'The bot creates a QR payment invoice with a unique comment and a 60-minute countdown. '
+        'Toncenter checks the blockchain and activates your subscription automatically after a matching transfer.\n\n'
         '1) Add me as channel administrator with Ban Users permission.\n'
         '2) /connect @yourchannel\n'
         '3) /subscribe @yourchannel\n\n'
-        'Commands: /channels, /status @channel, /recent @channel, /bursts @channel, '
-        '/paid INVOICE_ID TX_HASH, /help')
+        'Commands: /channels, /status @channel, /recent @channel, /bursts @channel, /privacy, /support')
 
 
 async def cmd_help(update,context):
@@ -467,7 +636,7 @@ async def cmd_privacy(update,context):
     await update.message.reply_text(
         'Privacy: The bot receives and stores the Telegram IDs, display names, usernames, '
         'join timestamps and moderation decisions of new channel subscribers (when Telegram delivers them). '
-        'It also stores channel IDs, connected managers, invoice IDs and submitted transaction hashes. '
+        'It also stores channel IDs, connected managers, invoice IDs and verified TON transaction hashes. '
         'The data is used to operate membership alerts, removals and subscription licensing. '
         'Records are retained in the service database until the operator deletes them. '
         'Only connected channel admins get alerts for their channel. '
@@ -506,17 +675,16 @@ async def cmd_subscribe(update,context):
     if row is None:return
     if row['free_owner']:
         await update.message.reply_text('✅ This channel has free owner access.');return
-    if not valid_mainnet_wallet(TON_WALLET) or not valid_mainnet_wallet(USDT_WALLET):
-        await update.message.reply_text('Payment wallet not set up correctly. Contact the bot owner.');return
+    if not valid_mainnet_wallet(TON_WALLET):
+        await update.message.reply_text('TON payment wallet is not configured correctly. Contact the bot owner.');return
     await update.message.reply_text(
         f'💳 30-day Guard subscription for {tag(row)}\n\n'
         'Price: $30 USD / 30 days per channel. Renewals add 30 days to existing time.\n'
-        'Choose TON or official USDT on TON network.\n\n'
-        'A unique payment memo will be issued. Payment is confirmed by an owner after '
-        'checking the blockchain. Never send USDT using TRC20, ERC20, or BSC.',
+        'Payment method: TON mainnet only.\n'
+        'Tap below to generate a unique TON invoice with QR code, copyable wallet address and a 60-minute countdown.\n'
+        'The payment comment is required for automatic matching.',
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton('TON',callback_data=f'p:TON:{row["chat_id"]}'),
-            InlineKeyboardButton('USDT (TON)',callback_data=f'p:USDT:{row["chat_id"]}')]]))
+            InlineKeyboardButton('Pay with TON',callback_data=f'p:TON:{row["chat_id"]}')]]))
 
 
 async def ton_quote()->tuple[str,str]:
@@ -533,98 +701,242 @@ async def ton_quote()->tuple[str,str]:
         return str(ton),str(price)
 
 
+def invoice_keyboard(inv, expired:bool=False):
+    rows=[[InlineKeyboardButton('📋 Copy TON wallet',copy_text=CopyTextButton(text=inv['wallet']))]]
+    if not expired:
+        rows.append([InlineKeyboardButton('Copy exact amount',copy_text=CopyTextButton(text=inv['amount'])),
+                     InlineKeyboardButton('Copy payment comment',copy_text=CopyTextButton(text=inv['memo']))])
+    rows.append([InlineKeyboardButton('🔄 Check payment',callback_data=f'paycheck:{inv["id"]}')])
+    return InlineKeyboardMarkup(rows)
+
+
+def invoice_caption(inv, now:float|None=None, paid:bool=False):
+    if paid:
+        return (f'✅ <b>Payment confirmed</b>\n'
+                f'Invoice: <code>{html.escape(inv["id"])}</code>\n'
+                f'Channel: {html.escape(inv["channel_label"]) }\n'
+                f'Paid: <b>{html.escape(inv["amount"])} TON</b>\n'
+                f'Subscription active until: <b>{html.escape(inv["active_until"])}</b>')
+    remaining=max(0,int(float(inv['expires_at'])-(time.time() if now is None else now)))
+    minutes,seconds=divmod(remaining,60)
+    if remaining:
+        timer=f'{minutes:02d}:{seconds:02d}'
+        status=f'⏳ <b>Time remaining: {timer}</b>'
+    else:
+        status='⌛ <b>Invoice expired</b> — do not send a new payment to this QR.'
+    return (f'🧾 <b>NomardDesk Guard — TON invoice</b>\n'
+            f'Invoice: <code>{html.escape(inv["id"])}</code>\n'
+            f'Channel: <b>{html.escape(inv["channel_label"])}</b>\n\n'
+            f'Pay exactly: <b>{html.escape(inv["amount"])} TON</b>\n'
+            f'Network: <b>TON mainnet</b>\n'
+            f'Wallet: <code>{html.escape(inv["wallet"])}</code>\n'
+            f'Payment comment (required): <code>{html.escape(inv["memo"])}</code>\n\n'
+            f'{status}\n\n'
+            'Scan the QR with a TON wallet, or copy the wallet, exact amount and payment comment with the buttons below. '
+            'Keep the payment comment exactly as shown. Toncenter verifies the transfer automatically.')
+
+
 async def new_payment(update,context,asset:str,cid:int):
     q=update.callback_query
+    if asset!='TON':
+        await q.answer('Only TON payments are enabled',show_alert=True);return
     if not await require_manager(update,context,cid):
         await q.answer('You are not a current channel admin',show_alert=True);return
     store=db(context)
     row=store.channel(cid)
     if row['free_owner']:
         await q.answer('This channel already has free owner access',show_alert=True);return
-    wallet=TON_WALLET if asset=='TON' else USDT_WALLET
+    wallet=TON_WALLET
     if not valid_mainnet_wallet(wallet):
-        await q.answer('Payment wallet not configured',show_alert=True);return
-    await q.answer('Preparing invoice')
-    if asset=='TON':
-        try: amount,rate=await ton_quote()
+        await q.answer('TON payment wallet not configured',show_alert=True);return
+    await q.answer('Preparing TON invoice')
+    invoice=store.active_invoice_for(cid,update.effective_user.id)
+    if not invoice:
+        try:
+            amount,_rate=await ton_quote()
         except (httpx.HTTPError,ValueError,ArithmeticError) as e:
             LOG.warning('TON quote unavailable: %s',e)
-            await q.message.reply_text('Live TON/USD price temporarily unavailable. Try again or choose USDT on TON.');return
-        label=f'{amount} TON (quoted at ${rate} per TON)'
+            await q.message.reply_text('Live TON/USD price is temporarily unavailable. Please try again.');return
+        invoice=store.create_invoice(cid,update.effective_user.id,amount,wallet)
+    ton_uri=build_ton_deep_link(invoice['wallet'],invoice['amount'],invoice['memo'],invoice['expires_at'])
+    qr=build_qr_image(ton_uri)
+    view=dict(invoice)
+    view['channel_label']=tag(row)
+    caption=invoice_caption(view)
+    try:
+        sent=await q.message.reply_photo(
+            photo=qr,caption=caption,parse_mode=ParseMode.HTML,
+            reply_markup=invoice_keyboard(invoice))
+        store.attach_invoice_message(invoice['id'],sent.chat_id,sent.message_id)
+    except TelegramError:
+        LOG.exception('Could not send TON payment QR for invoice %s',invoice['id'])
+        await q.message.reply_text('Could not send the payment QR. Please try /subscribe again.')
+        return
+
+
+async def toncenter_transactions(min_created_at:float|None=None)->list[dict]:
+    headers={'X-API-Key':TONCENTER_API_KEY} if TONCENTER_API_KEY else {}
+    params={'address':TON_WALLET,'limit':100}
+    results=[]
+    cursor=None
+    async with httpx.AsyncClient(timeout=20) as client:
+        for _ in range(10):
+            query=dict(params)
+            if cursor:
+                query.update({'lt':cursor[0],'hash':cursor[1]})
+                if not TONCENTER_API_KEY:
+                    await asyncio.sleep(1.1)  # Respect Toncenter's unauthenticated 1-RPS limit.
+            resp=await client.post(f'{TONCENTER_BASE_URL}/getTransactions',json=query,headers=headers)
+            resp.raise_for_status()
+            data=resp.json()
+            if not data.get('ok'):
+                raise RuntimeError(f'Toncenter API error: {data.get("error") or data}')
+            page=data.get('result') or []
+            if not isinstance(page,list) or not page:
+                break
+            results.extend(page)
+            oldest=page[-1]
+            oldest_time=int(oldest.get('utime') or 0)
+            if min_created_at is not None and oldest_time and oldest_time < min_created_at-120:
+                break
+            tid=oldest.get('transaction_id') or {}
+            if not tid.get('lt') or not tid.get('hash') or len(page)<100:
+                break
+            cursor=(str(tid['lt']),str(tid['hash']))
+    # De-duplicate pages because some API versions include the cursor transaction again.
+    unique={}
+    for tx in results:
+        tid=tx.get('transaction_id') or {}
+        key=tid.get('hash') or (tx.get('utime'),(tx.get('in_msg') or {}).get('hash'))
+        unique[key]=tx
+    return list(unique.values())
+
+
+async def update_invoice_message(bot,inv,caption:str,reply_markup=None):
+    if not inv['message_chat_id'] or not inv['message_id']:
+        return
+    try:
+        await bot.edit_message_caption(
+            chat_id=inv['message_chat_id'],message_id=inv['message_id'],
+            caption=caption,parse_mode=ParseMode.HTML,reply_markup=reply_markup)
+    except BadRequest as e:
+        if 'message is not modified' not in str(e).lower():
+            LOG.debug('Could not update invoice message %s: %s',inv['id'],e)
+    except TelegramError as e:
+        LOG.warning('Invoice message update failed for %s: %s',inv['id'],e)
+
+
+async def finish_paid_invoice(app,inv,tx_hash:str):
+    store:Store=app.bot_data['store']
+    ok,active_until=store.mark_invoice_paid(inv['id'],tx_hash)
+    if not ok:
+        if 'already used' not in active_until.lower():
+            LOG.info('Invoice %s not activated: %s',inv['id'],active_until)
+        return False
+    fresh=store.invoice(inv['id'])
+    channel=store.channel(inv['chat_id'])
+    view=dict(fresh)
+    view['channel_label']=tag(channel)
+    view['active_until']=active_until
+    await update_invoice_message(app.bot,fresh,invoice_caption(view,paid=True),reply_markup=None)
+    await send_to(app.bot,inv['payer_id'],text=(
+        f'✅ TON payment confirmed automatically.\n'
+        f'Channel: {tag(channel)}\n'
+        f'Subscription active until: {active_until}\n'
+        f'Transaction: {tx_hash}'))
+    for uid in store.recipients(inv['chat_id']):
+        if uid!=inv['payer_id']:
+            await send_to(app.bot,uid,text=f'✅ {tag(channel)} subscription renewed and is active until {active_until}.')
+    for owner in OWNER_IDS:
+        await send_to(app.bot,owner,text=(
+            f'💰 TON payment auto-verified.\nInvoice: {inv["id"]}\n'
+            f'Channel: {tag(channel)}\nAmount: {inv["amount"]} TON\n'
+            f'Transaction: {tx_hash}\nActive until: {active_until}'))
+    return True
+
+
+async def scan_pending_payments(app):
+    store:Store=app.bot_data['store']
+    lock=app.bot_data['payment_lock']
+    async with lock:
+        now=time.time()
+        invoices=store.pending_invoices(now)
+        if not invoices:
+            store.expire_old_invoices(now)
+            return 0
+        try:
+            txs=await toncenter_transactions(min(float(i['created_at']) for i in invoices))
+        except Exception as e:
+            LOG.warning('Toncenter payment scan failed: %s',e)
+            return 0
+        wallet_raw=ton_raw_address(TON_WALLET)
+        if not wallet_raw:
+            LOG.error('TON_WALLET could not be normalized; automatic payment checks disabled')
+            return 0
+        paid_count=0
+        for inv in invoices:
+            matched=None
+            for tx in txs:
+                if ton_transaction_matches_invoice(tx,inv,wallet_raw):
+                    matched=(tx.get('transaction_id') or {}).get('hash')
+                    break
+            if matched and await finish_paid_invoice(app,inv,str(matched)):
+                paid_count+=1
+                continue
+            # Update the visible countdown at most twice per minute per invoice.
+            fresh=store.invoice(inv['id'])
+            if fresh and store.countdown_bucket_changed(fresh):
+                channel=store.channel(inv['chat_id'])
+                view=dict(fresh);view['channel_label']=tag(channel)
+                remaining=float(fresh['expires_at'])-now
+                keyboard=None
+                if remaining>0:
+                    uri=build_ton_deep_link(fresh['wallet'],fresh['amount'],fresh['memo'],fresh['expires_at'])
+                    keyboard=invoice_keyboard(fresh)
+                else:
+                    keyboard=InlineKeyboardMarkup([[
+                        InlineKeyboardButton('🔄 Check payment',callback_data=f'paycheck:{fresh["id"]}')]])
+                await update_invoice_message(app.bot,fresh,invoice_caption(view,now=now),reply_markup=keyboard)
+                store.mark_countdown_bucket(fresh['id'])
+        store.expire_old_invoices(now)
+        return paid_count
+
+
+async def payment_watcher(app:Application):
+    while True:
+        try:
+            await scan_pending_payments(app)
+        except Exception:
+            LOG.exception('TON payment watcher failed')
+        await asyncio.sleep(PAYMENT_POLL_SECONDS)
+
+
+async def check_payment_callback(q,context,invoice_id:str):
+    inv=db(context).invoice(invoice_id)
+    if not inv or inv['payer_id']!=q.from_user.id:
+        await q.answer('Invoice not found',show_alert=True);return
+    if inv['state']=='paid':
+        await q.answer('Payment already confirmed');return
+    if inv['state']!='awaiting':
+        await q.answer('This invoice is closed or expired',show_alert=True);return
+    await q.answer('Checking TON blockchain…')
+    await scan_pending_payments(context.application)
+    latest=db(context).invoice(invoice_id)
+    if latest and latest['state']=='paid':
+        await q.message.reply_text('✅ Payment confirmed. Your channel subscription is active.')
     else:
-        amount='30.00'
-        label='30.00 USDT on TON network'
-    invoice=store.create_invoice(cid,update.effective_user.id,asset,amount,wallet)
-    await q.message.reply_text(
-        f'🧾 Invoice <code>{invoice["id"]}</code>\n'
-        f'Channel: {html.escape(tag(row))}\n'
-        f'Pay exactly: <b>{html.escape(label)}</b>\n'
-        f'Send to TON address: <code>{html.escape(wallet)}</code>\n'
-        f'Payment comment/memo: <code>{invoice["memo"]}</code>\n'
-        f'Quote expires: {stamp(invoice["expires_at"])}\n\n'
-        '⚠️ USDT must be official Tether USDT jetton on TON, not another network.\n'
-        'If your wallet allows a comment, include the exact memo.\n'
-        'After sending, submit your blockchain transaction hash using:\n'
-        f'<code>/paid {invoice["id"]} YOUR_TRANSACTION_HASH</code>\n\n'
-        'The owner will verify the transfer on-chain (recipient, amount, asset, memo if present, '
-        'confirmation and unused hash). Do not rely on screenshots.',
-        parse_mode=ParseMode.HTML)
-
-
-async def cmd_paid(update,context):
-    if not authorized_private(update):return
-    if len(context.args)!=2:
-        await update.message.reply_text('Usage: /paid INVOICE_ID TRANSACTION_HASH');return
-    invoice_id,tx=context.args
-    if not TX_RX.fullmatch(tx):
-        await update.message.reply_text('Transaction hash format looks incorrect. Paste the chain transaction hash.');return
-    inv=db(context).invoice(invoice_id)
-    if not inv or not await require_manager(update,context,inv['chat_id']):
-        await update.message.reply_text('Invoice not found or you cannot manage this channel.');return
-    result=db(context).submit_invoice(invoice_id,update.effective_user.id,tx)
-    if result!='ok':
-        await update.message.reply_text(result);return
-    await update.message.reply_text('✅ Submitted for on-chain verification. This does NOT activate your plan yet. You will get a message after review.')
-    channel=db(context).channel(inv['chat_id'])
-    msg=(f'💰 PAYMENT REVIEW REQUEST\n\nChannel: {tag(channel)}\n'
-         f'Invoice: {invoice_id}\nPayer: {update.effective_user.id}\n'
-         f'Expected: {inv["amount"]} {inv["asset"]} on TON\n'
-         f'Recipient: {inv["wallet"]}\nMemo: {inv["memo"]}\n'
-         f'Tx hash: {tx}\n\n'
-         'IMPORTANT: Independently verify transaction on TON blockchain, '
-         'recipient, asset, amount, confirmations, memo (if sent), and whether hash was used before approval. '
-         'The bot does NOT auto-check transfers.')
-    for oid in OWNER_IDS:
-        await send_to(context.bot,oid,text=msg,
-                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔎 Review invoice',callback_data=f'i:r:{invoice_id}')]]))
-
-
-async def owner_review(q,context,invoice_id:str):
-    inv=db(context).invoice(invoice_id)
-    if not inv or inv['state']!='submitted':
-        await q.answer('No submitted invoice',show_alert=True);return
-    await q.answer()
-    await q.message.reply_text(
-        f'⚠️ Confirm manual blockchain verification for invoice {invoice_id}\n'
-        f'Transfer: {inv["tx_hash"]}\nExpected: {inv["amount"]} {inv["asset"]}\n'
-        f'Recipient: {inv["wallet"]}\nMemo: {inv["memo"]}\n'
-        'Approve ONLY if you personally checked the real blockchain transaction '
-        'and it is final, inbound to your wallet, correct asset/amount and not reused.',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton('✅ I VERIFIED — Activate 30 days',callback_data=f'i:a:{invoice_id}')],
-            [InlineKeyboardButton('❌ Reject',callback_data=f'i:x:{invoice_id}')]]))
+        await q.message.reply_text('No matching confirmed transfer found yet. The bot will keep checking automatically. Make sure the exact amount and payment comment were included.')
 
 
 async def cmd_pending(update,context):
     if not is_owner(update):return
     waiting=db(context).invoices_waiting()
     if not waiting:
-        await update.message.reply_text('No payment submissions awaiting manual review.');return
-    for inv in waiting[:20]:
+        await update.message.reply_text('No active TON invoices awaiting payment.');return
+    for inv in waiting[:30]:
         await update.message.reply_text(
-            f'Invoice {inv["id"]}: {inv["amount"]} {inv["asset"]}, channel {inv["chat_id"]}\nTx {inv["tx_hash"]}',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton('Review',callback_data=f'i:r:{inv["id"]}')]]))
+            f'Invoice {inv["id"]}: {inv["amount"]} TON\nChannel {inv["chat_id"]}\n'
+            f'Expires {stamp(inv["expires_at"])}\nMemo {inv["memo"]}')
 
 
 async def cmd_grant(update,context):
@@ -881,35 +1193,12 @@ async def callbacks(update,context):
     data=q.data or ''
     parts=data.split(':')
     store=db(context)
-    if len(parts)==3 and parts[0]=='p' and parts[1] in ('TON','USDT'):
+    if len(parts)==3 and parts[0]=='p' and parts[1]=='TON':
         try:cid=int(parts[2])
         except ValueError:await q.answer('Invalid channel');return
-        await new_payment(update,context,parts[1],cid);return
-    if len(parts)==3 and parts[0]=='i':
-        if not is_owner(update):
-            await q.answer('Owner only',show_alert=True);return
-        action,invoice_id=parts[1:]
-        if action=='r':
-            await owner_review(q,context,invoice_id);return
-        inv=store.invoice(invoice_id)
-        if not inv or inv['state']!='submitted':
-            await q.answer('Invoice already closed',show_alert=True);return
-        if action=='a':
-            ok,reason=store.approve(invoice_id,update.effective_user.id)
-            await q.answer('Activated' if ok else reason,show_alert=not ok)
-            if ok:
-                await q.edit_message_reply_markup(reply_markup=None)
-                await q.message.reply_text(f'✅ Approved {invoice_id}. Active through {reason}.')
-                for u in store.recipients(inv['chat_id']):
-                    await send_to(context.bot,u,text=f'✅ Payment verified. {tag(store.channel(inv["chat_id"]))} active through {reason}.')
-            return
-        if action=='x':
-            store.reject(invoice_id,update.effective_user.id)
-            await q.answer('Rejected')
-            await q.edit_message_reply_markup(reply_markup=None)
-            await send_to(context.bot,inv['payer_id'],
-                text=f'❌ Invoice {invoice_id} was not approved. Contact support with the real chain transaction details.')
-            return
+        await new_payment(update,context,'TON',cid);return
+    if len(parts)==2 and parts[0]=='paycheck':
+        await check_payment_callback(q,context,parts[1]);return
     if len(parts)<3:return
     if parts[0]=='j' and parts[1] in ('k','r'):
         try:jid=int(parts[2])
@@ -1022,7 +1311,9 @@ async def post_init(app):
             with suppress(asyncio.QueueFull):q.put_nowait(jid)
     app.bot_data['worker']=asyncio.create_task(join_worker(app))
     app.bot_data['license_worker']=asyncio.create_task(subscription_watcher(app))
-    LOG.info('Subscriber Guard SaaS online, channels=%d, queued=%d',
+    app.bot_data['payment_lock']=asyncio.Lock()
+    app.bot_data['payment_worker']=asyncio.create_task(payment_watcher(app))
+    LOG.info('Subscriber Guard SaaS online, TON payment watcher enabled, channels=%d, queued=%d',
              len(store.channels_for(0,True)),q.qsize())
     for owner in OWNER_IDS:
         await send_to(app.bot,owner,text='🛡 Guard SaaS is online. /clients /pending /help')
@@ -1037,6 +1328,10 @@ async def post_shutdown(app):
     if license_worker:
         license_worker.cancel()
         with suppress(asyncio.CancelledError):await license_worker
+    payment_worker=app.bot_data.get('payment_worker')
+    if payment_worker:
+        payment_worker.cancel()
+        with suppress(asyncio.CancelledError):await payment_worker
     app.bot_data['store'].close()
 
 
@@ -1052,7 +1347,7 @@ def main():
     handlers={
         'start':cmd_start,'help':cmd_help,'privacy':cmd_privacy,'support':cmd_support,
         'connect':cmd_connect,'channels':cmd_channels,
-        'subscribe':cmd_subscribe,'paid':cmd_paid,'pending':cmd_pending,
+        'subscribe':cmd_subscribe,'pending':cmd_pending,
         'grant':cmd_grant,'clients':cmd_clients,'status':cmd_status,
         'recent':cmd_recent,'bursts':cmd_bursts,'unkeep':cmd_unkeep,'unban':cmd_unban,
     }
