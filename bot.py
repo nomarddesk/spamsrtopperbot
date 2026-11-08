@@ -386,11 +386,36 @@ async def post_init(app: Application) -> None:
     app.bot_data["channel_id"] = channel.id
     app.bot_data["channel_title"] = channel.title or CHANNEL
     myself = await app.bot.get_me()
-    me = await app.bot.get_chat_member(channel.id, myself.id)
-    if me.status not in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
-        raise RuntimeError("Add the bot as a channel administrator before starting it")
-    if not getattr(me, "can_restrict_members", False) and me.status != ChatMember.OWNER:
-        raise RuntimeError("Give the bot 'Ban Users' / 'Restrict Members' administrator permission")
+    me = None
+    try:
+        # Some public channels hide the member list from getChatMember, even
+        # when checking the bot's own ID. This is not a fatal startup error.
+        me = await app.bot.get_chat_member(channel.id, myself.id)
+    except BadRequest as exc:
+        if "member list is inaccessible" not in str(exc).lower():
+            raise
+        LOG.warning(
+            "Telegram would not expose channel members via getChatMember. "
+            "Trying getChatAdministrators to verify permissions instead."
+        )
+        try:
+            admins = await app.bot.get_chat_administrators(channel.id)
+            me = next((entry for entry in admins if entry.user.id == myself.id), None)
+        except TelegramError as admin_exc:
+            LOG.warning("Could not check channel administrators either: %s", admin_exc)
+
+    if me is not None:
+        if me.status not in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+            raise RuntimeError("Add the bot as a channel administrator before starting it")
+        if not getattr(me, "can_restrict_members", False) and me.status != ChatMember.OWNER:
+            raise RuntimeError("Give the bot 'Ban Users' / 'Restrict Members' administrator permission")
+        LOG.info("Bot channel administrator permissions verified")
+    else:
+        LOG.warning(
+            "Could not verify the bot's administrator rights for %s. "
+            "Bot will start, but to receive chat_member alerts and remove subscribers, "
+            "it MUST be an administrator with Ban Users permission in that channel.", CHANNEL
+        )
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=15000)
     app.bot_data["alert_queue"] = queue
@@ -465,12 +490,24 @@ async def remove_one(bot, channel_id: int, db: Store, user_id: int) -> str:
     """Ban one user; never ban channel admins or protected users."""
     if db.is_kept(user_id):
         return "protected"
-    member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-    if member.status in (ChatMember.OWNER, ChatMember.ADMINISTRATOR):
-        return "admin"
-    if not member_present(member):
-        db.set_user_decision(user_id, "left")
-        return "already_left"
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+    except BadRequest as exc:
+        if "member list is inaccessible" not in str(exc).lower():
+            raise
+        # Only execute this fallback for an observed, explicitly selected ID.
+        # Telegram itself rejects attempts to ban channel administrators.
+        # Ban Users permission is still required; failures are reported to admins.
+        LOG.warning(
+            "Member list unavailable while checking user %s; trying targeted ban "
+            "without member-status lookup", user_id
+        )
+    else:
+        if member.status in (ChatMember.OWNER, ChatMember.ADMINISTRATOR):
+            return "admin"
+        if not member_present(member):
+            db.set_user_decision(user_id, "left")
+            return "already_left"
     await bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
     db.set_user_decision(user_id, "removed")
     return "removed"
