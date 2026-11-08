@@ -1,7 +1,7 @@
 """Telegram public-channel subscriber guard.
 
 Watches Telegram's chat_member updates for a single public channel and sends
-admin-only Keep / Remove controls. Detects >= BURST_THRESHOLD distinct new
+Keep / Remove controls for each authorized admin. Detects >= BURST_THRESHOLD distinct new
 members over a rolling BURST_WINDOW_MINUTES and offers confirmed bulk removal.
 
 Telegram must actually deliver a chat_member update containing the user ID.
@@ -48,7 +48,19 @@ def positive_int(key: str, default: int) -> int:
 
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+def parse_admin_ids(raw: str) -> frozenset[int]:
+    """Accept one or more comma-separated numeric Telegram user IDs."""
+    values = [part.strip() for part in raw.split(",") if part.strip()]
+    try:
+        ids = frozenset(int(value) for value in values)
+    except ValueError as exc:
+        raise SystemExit("ADMIN_ID must contain numeric Telegram IDs separated by commas") from exc
+    if not ids or any(admin_id <= 0 for admin_id in ids):
+        raise SystemExit("Set ADMIN_ID to one or more positive numeric Telegram user IDs")
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_ID", ""))
 CHANNEL = os.getenv("CHANNEL_USERNAME", "@massageservice0001").strip()
 DB_PATH = os.getenv("DB_PATH", "./guard.db")
 BURST_THRESHOLD = positive_int("BURST_THRESHOLD", 200)
@@ -275,7 +287,7 @@ def store(context: ContextTypes.DEFAULT_TYPE) -> Store:
 
 def admin_chat(update: Update) -> bool:
     return bool(
-        update.effective_user and update.effective_user.id == ADMIN_ID
+        update.effective_user and update.effective_user.id in ADMIN_IDS
         and update.effective_chat and update.effective_chat.type == ChatType.PRIVATE
     )
 
@@ -300,6 +312,20 @@ def keyboard_for_burst(burst_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+async def notify_admins(bot, **message_kwargs) -> int:
+    """Send one notification to each admin. They must /start the bot first."""
+    delivered = 0
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await bot.send_message(chat_id=admin_id, **message_kwargs)
+            delivered += 1
+        except Forbidden:
+            LOG.warning("Cannot message admin %s: they must open the bot and tap START", admin_id)
+        except TelegramError:
+            LOG.exception("Could not send an admin notification to %s", admin_id)
+    return delivered
+
+
 async def send_join_alert(bot, entry) -> None:
     person = html.escape(entry["display_name"][:160])
     username = f"@{html.escape(entry['username'])}" if entry["username"] else "No username"
@@ -312,13 +338,15 @@ async def send_join_alert(bot, entry) -> None:
         "Choose <b>Keep</b> to protect this account from bulk removal, "
         "or <b>Remove</b> to ban it from the channel."
     )
-    await bot.send_message(
-        chat_id=ADMIN_ID,
+    delivered = await notify_admins(
+        bot,
         text=text,
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard_for_join(entry["id"]),
         disable_web_page_preview=True,
     )
+    if not delivered:
+        raise Forbidden("Neither admin can receive the join alert. Both must /start the bot.")
 
 
 async def alert_worker(app: Application) -> None:
@@ -370,15 +398,11 @@ async def post_init(app: Application) -> None:
         queue.put_nowait(join_id)
     app.bot_data["worker_task"] = asyncio.create_task(alert_worker(app))
     LOG.info("Tracking channel %s (ID %s). %s pending alerts", CHANNEL, channel.id, queue.qsize())
-    try:
-        await app.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🛡 Subscriber Guard online for {CHANNEL}.\nUse /status or /help.",
-        )
-    except Forbidden:
-        LOG.warning("Admin must open the bot in Telegram and tap START first")
-    except TelegramError:
-        LOG.exception("Startup admin notification failed")
+    delivered = await notify_admins(
+        app.bot, text=f"🛡 Subscriber Guard online for {CHANNEL}.\nUse /status or /help."
+    )
+    if not delivered:
+        LOG.warning("No admins could receive the startup notification; open the bot and tap START")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -418,8 +442,8 @@ async def member_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             count, eligible = db.burst_stats(burst_id)
             LOG.warning("Burst %s opened: %d joins", burst_id, recent_count)
             try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
+                await notify_admins(
+                    context.bot,
                     text=(
                         f"🚨 MASS-JOIN ALERT\n\n"
                         f"{recent_count} unique accounts joined {CHANNEL} "
@@ -504,8 +528,9 @@ async def bulk_job(app: Application, burst_id: int, chat_id: int, message_id: in
         LOG.exception("Bulk job for burst %d crashed; can retry via /bursts", burst_id)
         with db.conn:
             db.conn.execute("UPDATE bursts SET state='open' WHERE id=?", (burst_id,))
-        with suppress(TelegramError):
-            await app.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Burst #{burst_id} interrupted; use /bursts to retry.")
+        await notify_admins(
+            app.bot, text=f"⚠️ Burst #{burst_id} interrupted; use /bursts to retry."
+        )
 
 
 async def actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -706,8 +731,8 @@ async def command_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
-    if not TOKEN or ADMIN_ID <= 0:
-        raise SystemExit("Set BOT_TOKEN and numeric ADMIN_ID environment variables before running.")
+    if not TOKEN or not ADMIN_IDS:
+        raise SystemExit("Set BOT_TOKEN and ADMIN_ID (comma-separated numeric IDs) before running.")
     if not CHANNEL.startswith("@"):
         raise SystemExit("CHANNEL_USERNAME must be like @massageservice0001")
     db = Store(DB_PATH)
