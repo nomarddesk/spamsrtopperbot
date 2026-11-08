@@ -324,6 +324,23 @@ class Store:
         with self.db:
             self.db.execute('UPDATE channels SET expires_at=? WHERE chat_id=?',
                             (max(now, float(self.channel(cid)['expires_at']))+days*86400,cid))
+
+    def disconnect(self,cid:int)->bool:
+        'Remove a channel from monitoring while retaining payment audit records.'
+        if self.channel(cid) is None:
+            return False
+        with self.db:
+            # Cancel unpaid invoices so a late transfer cannot activate a deleted channel.
+            self.db.execute("UPDATE invoices SET state='cancelled' WHERE chat_id=? AND state='awaiting'",(cid,))
+            self.db.execute('''DELETE FROM burst_members WHERE burst_id IN
+                (SELECT id FROM bursts WHERE chat_id=?)''',(cid,))
+            self.db.execute('DELETE FROM bursts WHERE chat_id=?',(cid,))
+            self.db.execute('DELETE FROM joins WHERE chat_id=?',(cid,))
+            self.db.execute('DELETE FROM kept WHERE chat_id=?',(cid,))
+            self.db.execute('DELETE FROM managers WHERE chat_id=?',(cid,))
+            self.db.execute('DELETE FROM license_notices WHERE chat_id=?',(cid,))
+            self.db.execute('DELETE FROM channels WHERE chat_id=?',(cid,))
+        return True
     def create_invoice(self,cid:int,payer:int,amount:str,wallet:str):
         invoice_id='NG'+secrets.token_hex(5).upper()
         memo='NSG-'+secrets.token_hex(6).upper()
@@ -950,6 +967,30 @@ async def cmd_grant(update,context):
         await send_to(context.bot,uid,text=f'✅ Your channel {tag(row)} is now active through {stamp(db(context).channel(row["chat_id"])["expires_at"])}.')
 
 
+async def cmd_disconnect(update,context):
+    'Owner-only removal of a channel from the Subscriber Guard service.'
+    if not is_owner(update):return
+    if len(context.args)!=1:
+        await update.message.reply_text('Usage: /disconnect @channelusername')
+        return
+    try:
+        row=await resolve_registered(context,context.args[0])
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    cid=int(row['chat_id'])
+    channel_name=tag(row)
+    if not db(context).disconnect(cid):
+        await update.message.reply_text('That channel is not connected.')
+        return
+    _ADMIN_CACHE.pop(cid,None)
+    await update.message.reply_text(
+        f'✅ Disconnected {channel_name}.\n'
+        'It has been removed from the connected-channel list and monitoring has stopped. '
+        'The bot remains a Telegram channel admin; remove it manually in Telegram if you no longer need it there.'
+    )
+
+
 async def cmd_clients(update,context):
     if not is_owner(update):return
     rows=db(context).channels_for(0,all_channels=True)
@@ -1345,7 +1386,7 @@ def main():
         'start':cmd_start,'help':cmd_help,'privacy':cmd_privacy,'support':cmd_support,
         'connect':cmd_connect,'channels':cmd_channels,
         'subscribe':cmd_subscribe,'pending':cmd_pending,
-        'grant':cmd_grant,'clients':cmd_clients,'status':cmd_status,
+        'grant':cmd_grant,'disconnect':cmd_disconnect,'clients':cmd_clients,'status':cmd_status,
         'recent':cmd_recent,'bursts':cmd_bursts,'unkeep':cmd_unkeep,'unban':cmd_unban,
     }
     for command,fn in handlers.items():app.add_handler(CommandHandler(command,fn))
