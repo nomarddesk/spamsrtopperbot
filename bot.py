@@ -1,4 +1,4 @@
-"""NomardDesk Subscriber Guard SaaS.
+"""Subscriber Guard SaaS.
 
 A single Telegram bot can protect multiple PUBLIC channels. Each connected channel
 has its own 30-day license, monitored join events, Keep/Remove decisions and bursts.
@@ -588,12 +588,9 @@ async def check_ref(update,context,with_arg:bool=True):
 async def cmd_start(update,context):
     if not authorized_private(update):return
     await update.message.reply_text(
-        '🛡 NomardDesk Subscriber Guard\n\n'
+        '🛡 Subscriber Guard\n\n'
         'Protect public Telegram channels without CAPTCHA. New-member alerts have '
         'Keep / Remove buttons. When 200 join within 10 minutes, review a bulk-removal batch.\n\n'
-        '💳 $30 per channel / 30 days. TON mainnet only.\n'
-        'The bot creates a QR payment invoice with a unique comment and a 60-minute countdown. '
-        'Toncenter checks the blockchain and activates your subscription automatically after a matching transfer.\n\n'
         '1) Add me as channel administrator with Ban Users permission.\n'
         '2) /connect @yourchannel\n'
         '3) /subscribe @yourchannel\n\n'
@@ -724,7 +721,7 @@ def invoice_caption(inv, now:float|None=None, paid:bool=False):
         status=f'⏳ <b>Time remaining: {timer}</b>'
     else:
         status='⌛ <b>Invoice expired</b> — do not send a new payment to this QR.'
-    return (f'🧾 <b>NomardDesk Guard — TON invoice</b>\n'
+    return (f'🧾 <b>Subscriber Guard — TON invoice</b>\n'
             f'Invoice: <code>{html.escape(inv["id"])}</code>\n'
             f'Channel: <b>{html.escape(inv["channel_label"])}</b>\n\n'
             f'Pay exactly: <b>{html.escape(inv["amount"])} TON</b>\n'
